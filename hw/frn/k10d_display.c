@@ -25,9 +25,13 @@
 #include "ui/input.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "qemu/timer.h"
 #include "k10d_display.h"
 
 void k10d_cpucom_post_key_record(const uint8_t *payload9);   /* target/frn/k10d_cpucom.c */
+void k10d_cpucom_post_msg(char c, const uint8_t *payload, int n);   /* FRN_MSG_FILE */
+void k10d_cpucom_raise_vec(int v);
+void k10d_cpucom_hold_lines(uint32_t set, uint32_t clr);
 
 #define W 640
 #define H 480
@@ -108,7 +112,22 @@ static void k10d_key_event(DeviceState *dev, QemuConsole *src, QemuInputEvent *e
     case Q_KEY_CODE_DOWN:  byte = 3; bit = 0x04; break;
     case Q_KEY_CODE_UP:    byte = 3; bit = 0x08; break;
     case Q_KEY_CODE_RET: case Q_KEY_CODE_KP_ENTER: byte = 3; bit = 0x10; break;
-    case Q_KEY_CODE_M:     byte = 3; bit = 0x80; break;   /* MENU */
+    case Q_KEY_CODE_M: case Q_KEY_CODE_ESC: byte = 3; bit = 0x80; break;   /* MENU / back (Esc) */
+    /* Found with the firmware's own SWITCH TEST screen (debug menu, MODSET.TXT [OPEN_DEBUG_MENU]) by
+     * clearing each record bit in turn and reading which label lit up. Active-low like the rest. */
+    case Q_KEY_CODE_S:     byte = 0; bit = 0x01; break;   /* SWS: shutter half-press */
+    case Q_KEY_CODE_A:     byte = 0; bit = 0x08; break;   /* AFSTART (AF button) */
+    case Q_KEY_CODE_E:     byte = 2; bit = 0x01; break;   /* AEL */
+    case Q_KEY_CODE_G:     byte = 2; bit = 0x02; break;   /* GREEN */
+    case Q_KEY_CODE_W:     byte = 2; bit = 0x04; break;   /* PRV (preview) */
+    case Q_KEY_CODE_D:     byte = 2; bit = 0x20; break;   /* DISP (same bit as V) */
+    case Q_KEY_CODE_Z:     byte = 2; bit = 0x80; break;   /* XV / AVSET (one of the two) */
+    case Q_KEY_CODE_R:     byte = 5; bit = 0x01; break;   /* RAW */
+    case Q_KEY_CODE_X:     byte = 5; bit = 0x04; break;   /* SR (shake reduction) */
+    case Q_KEY_CODE_BACKSPACE: case Q_KEY_CODE_DELETE:
+                           byte = 5; bit = 0x40; break;   /* ERASE */
+    case Q_KEY_CODE_U:     byte = 4; bit = 0x01; break;   /* FLPOP: flash pop-up */
+    case Q_KEY_CODE_C:     byte = 2; bit = 0x08; break;   /* DOOR: card door */
     case Q_KEY_CODE_I:     byte = 2; bit = 0x10; break;   /* INFO (opens the shooting-info screen from idle) */
     case Q_KEY_CODE_V:     byte = 2; bit = 0x20; break;   /* playback: item 0xe, the shooting-mode handler's mode switch (unconfirmed) */
     case Q_KEY_CODE_F:     byte = 5; bit = 0x08; break;   /* Fn (opens the Fn menu from idle) */
@@ -133,8 +152,77 @@ static const QemuInputHandler k10d_key_handler = {
     .event = k10d_key_event,
 };
 
+/* FRN_REC_FILE=<path>: debug aid. Every 100 ms the file is read; it holds the 9 payload bytes of
+ * the 'A' button record as hex ("ffffffffffffffffff", active-low). A change is posted to the
+ * companion-CPU model exactly like a key event. Used to find which bit drives which switch
+ * on the firmware's SWITCH TEST screen. */
+static QEMUTimer *rec_timer;
+static uint8_t rec_prev[9] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+static void k10d_rec_file_poll(void *opaque)
+{
+    const char *path = getenv("FRN_REC_FILE");
+    FILE *f = path ? fopen(path, "r") : NULL;
+    if (f) {
+        char line[64] = "";
+        if (fgets(line, sizeof line, f) && strlen(line) >= 18) {
+            uint8_t nr[9]; bool ok = true;
+            for (int i = 0; i < 9 && ok; i++) {
+                unsigned v;
+                ok = sscanf(line + 2 * i, "%2x", &v) == 1;
+                nr[i] = v;
+            }
+            if (ok && memcmp(nr, rec_prev, 9)) {
+                memcpy(rec_prev, nr, 9);
+                memcpy(rec, nr, 9);
+                fprintf(stderr, "[k10d] rec-file -> %02x%02x%02x%02x%02x%02x%02x%02x%02x\n", rec[0],rec[1],rec[2],rec[3],rec[4],rec[5],rec[6],rec[7],rec[8]);
+                k10d_cpucom_post_key_record(rec);
+            }
+        }
+        fclose(f);
+    }
+    /* FRN_MSG_FILE=<path>: when its contents change, each line "<letter> [hex payload]" is queued
+     * as a companion-CPU status message (unset payload bytes stay 0xff). Debug aid. */
+    const char *mp = getenv("FRN_MSG_FILE");
+    FILE *mf = mp ? fopen(mp, "r") : NULL;
+    if (mf) {
+        static char prev[2048]; char buf[2048] = "";
+        size_t n = fread(buf, 1, sizeof buf - 1, mf); buf[n] = 0; fclose(mf);
+        if (strcmp(buf, prev)) {
+            memcpy(prev, buf, sizeof prev);
+            for (char *ln = strtok(buf, "\n"); ln; ln = strtok(NULL, "\n")) {
+                if (!ln[0] || ln[0] == '#') continue;
+                if (ln[0] == '!') {     /* "!<vec>": raise that interrupt vector once */
+                    int v = atoi(ln + 1);
+                    fprintf(stderr, "[k10d] msg-file -> raise vector %d\n", v);
+                    k10d_cpucom_raise_vec(v);
+                    continue;
+                }
+                if (ln[0] == '+' || ln[0] == '-') {   /* "+01" / "-01": hold / release 0x50000106 input bits */
+                    uint32_t m = strtoul(ln + 1, NULL, 16);
+                    fprintf(stderr, "[k10d] msg-file -> %s lines 0x%02x on 0x50000106\n", ln[0] == '+' ? "hold" : "release", m);
+                    k10d_cpucom_hold_lines(ln[0] == '+' ? m : 0, ln[0] == '-' ? m : 0);
+                    continue;
+                }
+                uint8_t pl[80]; int k = 0; char *s = ln + 1;
+                while (*s && k < 80) {
+                    while (*s == ' ' || *s == ',') s++;
+                    unsigned v; if (sscanf(s, "%2x", &v) != 1) break;
+                    pl[k++] = v; s += 2;
+                }
+                fprintf(stderr, "[k10d] msg-file -> '%c' (%d payload bytes)\n", ln[0], k);
+                k10d_cpucom_post_msg(ln[0], pl, k);
+            }
+        }
+    }
+    timer_mod(rec_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+}
+
 void k10d_display_init(void)
 {
+    if (getenv("FRN_REC_FILE") || getenv("FRN_MSG_FILE")) {
+        rec_timer = timer_new_ms(QEMU_CLOCK_REALTIME, k10d_rec_file_poll, NULL);
+        timer_mod(rec_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
+    }
     con = qemu_graphic_console_create(NULL, 0, &k10d_display_ops, NULL);
     qemu_console_resize(con, W, H);
     QemuInputHandlerState *hs = qemu_input_handler_register(NULL, &k10d_key_handler);

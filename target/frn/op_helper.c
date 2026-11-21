@@ -402,6 +402,16 @@ static inline void frn_rd_watch(CPUFRNState *e, uint32_t a)
                 fprintf(frn_tr_out ? frn_tr_out : stderr,
                         "[rdwatch] read 0x%08x (+0x%lx) from pc~0x%08x\n",
                         a, (long)(a - frn_rdwatch), e->pc);
+                /* FRN_RDWATCH_STACK=1: also list the code addresses on the stack (caller chain). */
+                if (getenv("FRN_RDWATCH_STACK")) {
+                    FILE *o = frn_tr_out ? frn_tr_out : stderr;
+                    fprintf(o, "[rdwatch]   rp 0x%08x stack:", e->rp);
+                    for (int k = 0; k < 256; k++) {
+                        uint32_t sv = cpu_ldl_be_data(e, e->regs[15] + k * 4);
+                        if (sv >= 0x10000000u && sv < 0x10560000u) fprintf(o, " 0x%08x", sv);
+                    }
+                    fprintf(o, "\n");
+                }
             }
         }
     }
@@ -857,6 +867,7 @@ static void frn_ft_init(void)
     const char *p = getenv("FRN_FT_PC");   if (p) frn_ft_pcstart = strtoul(p, NULL, 16);
     const char *w = getenv("FRN_FT_WIN");  if (w) frn_ft_win = strtol(w, NULL, 0);
     const char *f = getenv("FRN_FT_FULLREGS"); if (f) frn_ft_fullregs = 1;
+    if (getenv("FRN_FT_GO") && !frn_ft_pcstart) frn_ft_pcstart = 1;   /* wait for the GO file (pc 1 never matches) */
 }
 static inline void frn_ft_mem(char kind, uint32_t a, uint32_t v, int sz)
 {
@@ -905,6 +916,9 @@ static void frn_tmr_ctrl_written(CPUFRNState *e, int ch, uint32_t v)
     if (frn_tmr_ipt < 0) { const char *s = getenv("FRN_TMR_IPT"); frn_tmr_ipt = s ? strtol(s, NULL, 0) : 1;
                            if (frn_tmr_ipt < 1) frn_tmr_ipt = 1; }
     frn_tmr_poll(e, ch);
+    { static int dbg = -1; if (dbg < 0) dbg = getenv("FRN_TMR_DBG") != NULL;
+      if (dbg) fprintf(stderr, "[tmr] ch%d ctrl<-%04x run=%d uf=%d ic=%ld rl=%u pc=%08x\n", ch, v, frn_tmr_run[ch],
+                       frn_tmr_uf[ch], frn_ic, cpu_ldl_be_data(e, FRN_TMR_BASE + ch * 0x10 + 8), e->pc); }
     if (!(v & 0x4)) frn_tmr_uf[ch] = 0;
     /* Fujitsu reload timer TMCSR: bit1 CNTE (count enable), bit0 TRG (software trigger, reads 0).
      * The firmware clears UF with a read-modify-write; if TRG read back as 1 that write retriggered
@@ -981,7 +995,7 @@ static inline uint32_t rd8(CPUFRNState *e, uint32_t a)
              * Lines 0x02/0x04 keep the inverse-of-request rule (boot handshake depends on it). */
             uint32_t ack = ((~b) >> 5) & 0x06u;
             if (frn_hs_busy[0] > 0) { ack |= 0x01; frn_hs_busy[0]--; }
-            return (b & 0xf8u) | ack; } }
+            return (b & 0xf8u) | ack | (k10d_cpucom_hold106 & 0x07u); } }
     if (a == SPI_DATA) { frn_spi_init();
         if (frn_spi_on) {
             /* Select the reply by the captured command byte (frn_spi_tx[0]). Cmd:01 is
@@ -1128,6 +1142,15 @@ static inline void wr8(CPUFRNState *e, uint32_t a, uint32_t v)
         frn_spi_init();
         if (frn_spi_on && frn_spi_txlen < (int)sizeof frn_spi_tx) {
             frn_spi_tx[frn_spi_txlen++] = v & 0xff;
+            if (frn_spi_txlen == 1 && (v & 0xff) == 0x02 && getenv("FRN_DSP_STACK")) {
+                /* debug: who sends CPUCOM Cmd 0x02? print code-looking words from the stack */
+                fprintf(stderr, "[stack] Cmd:02 sent, pc=0x%08x rp=0x%08x sp=0x%08x\n   ", e->pc, e->rp, e->regs[15]);
+                for (int k = 0; k < 96; k++) {
+                    uint32_t w = cpu_ldl_be_data(e, e->regs[15] + k * 4);
+                    if (w >= 0x10000000u && w < 0x10800000u) fprintf(stderr, " %08x", w);
+                }
+                fprintf(stderr, "\n");
+            }
             k10d_cpucom_tx(v & 0xff);
             if (getenv("FRN_SPI_LOG")) fprintf(frn_tr_out ? frn_tr_out : stderr,
                 "[spi] TX byte[%d]=0x%02x pc=0x%08x\n", frn_spi_txlen - 1, v & 0xff, e->pc);
@@ -1592,8 +1615,8 @@ static void frn_deliver(CPUFRNState *e)
     /* fixed sources: timer, dicr, watch-counter, timer bank, cpucom, imgproc, 2 x rescon */
     /* static: QEMU builds with -ftrivial-auto-var-init=zero, which zero-filled these locals on
      * every instruction (75% of this function's time). One vCPU thread uses them. */
-    static uint32_t lev[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
-    static int kind[8 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
+    static uint32_t lev[16 + FRN_FIRE_MAX + FRN_AUTOTIMER_N], vec[16 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
+    static int kind[16 + FRN_FIRE_MAX + FRN_AUTOTIMER_N];
     int n = 0;
     if (e->pending_valid) { lev[n] = e->pending_level; vec[n] = e->pending_vec; kind[n] = 0; n++; }
     if (e->dicr_pending)  { lev[n] = frn_icr(e, 0x46f) & 0x1F; vec[n] = DELAYED_VEC; kind[n] = 1; n++; }
@@ -1618,6 +1641,17 @@ static void frn_deliver(CPUFRNState *e)
     static int cpucom_attn = 0;
     if (!cpucom_attn && k10d_cpucom_enabled() && k10d_cpucom_attention()) cpucom_attn = 1;
     if (cpucom_attn) { lev[n] = frn_icr(e, 0x44f) & 0x1F; vec[n] = 31; kind[n] = 4; n++; }
+    /* One-shot vectors requested via FRN_MSG_FILE "!<vec>". External INT ch k = vector 30+k
+     * (ch1 = vec31 = cpucom attention), so also latch EIRR (0x38) bit k for those. */
+    static uint64_t ext_pend = 0;
+    uint64_t nv = k10d_cpucom_take_vecs();
+    if (nv) {
+        ext_pend |= nv;
+        for (int v = 30; v < 38; v++) if (nv & (1ull << v)) wr8(e, 0x38, rd8(e, 0x38) | (1u << (v - 30)));
+    }
+    for (int v = 16, m = 0; v < 64 && ext_pend && m < 8; v++) if (ext_pend & (1ull << v)) {
+        lev[n] = frn_icr(e, 0x440 + (v - 16)) & 0x1F; vec[n] = v; kind[n] = 7; n++; m++;
+    }
     /* Image-processor operation engine (k10d_imgproc.c): vector 35, level from ICR19,
      * level-triggered while an enabled status bit is pending. */
     if (k10d_img_irq()) {
@@ -1642,6 +1676,7 @@ static void frn_deliver(CPUFRNState *e)
         if (kind[i] == 0) e->pending_valid = 0;  /* DICR stays until FW clears 0x44 */
         if (kind[i] == 2) e->wc_pending = 0;
         if (kind[i] == 4) cpucom_attn = 0;
+        if (kind[i] == 7) ext_pend &= ~(1ull << vec[i]);
         if (kind[i] >= 10 && kind[i] < 30) frn_fire_pending[kind[i] - 10] = 0;
         if (kind[i] >= 30) frn_autotimer_pending[kind[i] - 30] = 0;
         uint32_t saved_ps = pack_ps(e);  /* FR: save pre-trap PS (user S=1) BEFORE entering system mode */
@@ -1653,7 +1688,7 @@ static void frn_deliver(CPUFRNState *e)
         if (frn_tr_irq) {
             fprintf(frn_tr_out, "[irq] vec%-2u %-9s -> 0x%08x  ilm->%-2u  "
                     "from 0x%08x\n", vec[i],
-                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]==4?"cpucom":kind[i]==5?"imgproc":kind[i]==6?"rescon":kind[i]>=30?"autotmr":"fire",
+                    kind[i]==0?"timer":kind[i]==3?"tmrbank":kind[i]==1?"dicr":kind[i]==2?"watch-cnt":kind[i]==4?"cpucom":kind[i]==5?"imgproc":kind[i]==6?"rescon":kind[i]==7?"ext":kind[i]>=30?"autotmr":"fire",
                     handler, lev[i], rd32(e, e->regs[15]));
         }
         return;
@@ -1831,10 +1866,35 @@ static void frn_interp_one(CPUFRNState *env)
         if (frn_ft_pcstart && !frn_ft_started && pc == frn_ft_pcstart) {
             frn_ft_started = 1; frn_ft_from = frn_ic; frn_ft_to = frn_ic + frn_ft_win;
         }
+        /* FRN_FT_GO=path: start the FRN_FT_WIN window once this file exists (checked every
+         * 2^20 instructions), so a trace can be armed from outside right before an action. */
+        { static const char *go = (const char *)1;
+          if (go == (const char *)1) go = getenv("FRN_FT_GO");
+          if (go && !frn_ft_started && (frn_ic & 0xfffff) == 0 && access(go, F_OK) == 0) {
+              frn_ft_pcstart = 1; frn_ft_started = 1; frn_ft_from = frn_ic; frn_ft_to = frn_ic + frn_ft_win;
+              fprintf(stderr, "[ft] FRN_FT_GO: window starts at ic %ld\n", frn_ic);
+          } }
         frn_ft_active = (frn_ic >= frn_ft_from &&
                          (frn_ft_to == 0 || frn_ic <= frn_ft_to) &&
                          (!frn_ft_pcstart || frn_ft_started));
-        if (frn_ft_active) {
+        /* FRN_FT_FUNCS=file ("0xADDR name" lines): only log entries to listed PCs. */
+        static int fn_init = 0; static uint32_t *fn_tab = NULL; static int fn_n = 0;
+        if (!fn_init) {
+            fn_init = 1; const char *ff = getenv("FRN_FT_FUNCS");
+            FILE *fp = ff ? fopen(ff, "r") : NULL;
+            if (fp) { char ln[256]; int cap = 0;
+                while (fgets(ln, sizeof ln, fp)) { if (strncmp(ln, "0x", 2)) continue;
+                    if (fn_n == cap) { cap = cap ? cap * 2 : 4096; fn_tab = g_renew(uint32_t, fn_tab, cap); }
+                    fn_tab[fn_n++] = (uint32_t)strtoul(ln, NULL, 16); }
+                fclose(fp); }
+        }
+        if (frn_ft_active && fn_tab) {
+            int lo = 0, hi = fn_n - 1, hit = 0;   /* index is sorted */
+            while (lo <= hi) { int m = (lo + hi) / 2;
+                if (fn_tab[m] == pc) { hit = 1; break; } if (fn_tab[m] < pc) lo = m + 1; else hi = m - 1; }
+            if (hit) fprintf(frn_ft_fp, "%ld F=0x%08x r4=%08x r5=%08x r6=%08x rp=%08x\n",
+                             frn_ic, pc, r[4], r[5], r[6], env->rp);
+        } else if (frn_ft_active) {
             if (frn_ft_fullregs)
                 fprintf(frn_ft_fp, "%ld PC=0x%08x r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x r9=%08x r10=%08x r11=%08x r12=%08x r13=%08x r14=%08x r15=%08x\n",
                         frn_ic, pc, r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15]);

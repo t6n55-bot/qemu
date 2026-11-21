@@ -157,9 +157,28 @@ void k10d_cpucom_post_key_record(const uint8_t *payload9)
     __atomic_store_n(&key_w, w + 1, __ATOMIC_RELEASE);
 }
 
+/* Arbitrary status messages from the main-loop thread (FRN_MSG_FILE, k10d_display.c). */
+static Msg msg_ring[KEY_RING];
+static volatile unsigned msg_w, msg_r;
+void k10d_cpucom_post_msg(char c, const uint8_t *payload, int n);
+void k10d_cpucom_post_msg(char c, const uint8_t *payload, int n)
+{
+    unsigned w = msg_w;
+    if (w - msg_r >= KEY_RING || letter_size(c) < 0) return;
+    Msg *m = &msg_ring[w % KEY_RING];
+    build_status(c, m);
+    for (int i = 0; i < n && i < m->len - 2; i++) m->b[2 + i] = payload[i];
+    __atomic_store_n(&msg_w, w + 1, __ATOMIC_RELEASE);
+}
+
 void k10d_cpucom_tick(void)
 {
     st_insns++;
+    while (msg_r != __atomic_load_n(&msg_w, __ATOMIC_ACQUIRE) && late_tail - late_head < LATE_MAX) {
+        late_due[late_tail++ % LATE_MAX] = msg_ring[msg_r % KEY_RING];
+        if (st_log) fprintf(st_out ? st_out : stderr, "[dsp] msg-file: queued '%c'\n", msg_ring[msg_r % KEY_RING].b[0]);
+        msg_r++; st_attn_sent = 0;
+    }
     /* Button records are released at least KEY_GAP instructions apart: the firmware does not
      * register a release that follows its press by less than ~4-5M instructions (measured: a
      * 3M hold leaves the key "held" and the next press is ignored; 5M works). This emulator
@@ -237,9 +256,26 @@ void k10d_cpucom_txn_start(FILE *out)
         for (int i = 2; i < st_txlen && i < 2 + 16; i++) fprintf(st_out, " %02x", st_tx[i]);
         fprintf(st_out, "%s\n", st_txlen > 18 ? " ..." : "");
     }
+    if (st_txlen >= 3 && st_tx[0] == 0x02 && st_tx[2] == 0x01 && getenv("FRN_DSP_ON02")) {
+        /* experiment: after a release request (Cmd 0x02, 01 00) queue status letter(s) */
+        for (const char *q = getenv("FRN_DSP_ON02"); *q; q++)
+            if (letter_size(*q) >= 0 && late_tail - late_head < LATE_MAX) {
+                Msg m; build_status(*q, &m); late_due[late_tail++ % LATE_MAX] = m;
+                if (st_log) fprintf(st_out, "[dsp] queued '%c' after release request\n", *q);
+            }
+        st_attn_sent = 0;
+    }
     st_txlen = 0; st_pos = 0; st_cmd = -1;
     st_attn_sent = 0;              /* a transaction happened: may signal again if still pending */
 }
+
+/* One-shot external interrupt requests (FRN_MSG_FILE line "!<vec>"), consumed by frn_deliver. */
+static volatile uint64_t ext_vec_req;
+void k10d_cpucom_raise_vec(int v) { if (v >= 0 && v < 64) __atomic_or_fetch(&ext_vec_req, 1ull << v, __ATOMIC_SEQ_CST); }
+/* Forced companion input lines on port 0x50000106 (FRN_MSG_FILE "+<hex>" / "-<hex>"). */
+volatile uint32_t k10d_cpucom_hold106;
+void k10d_cpucom_hold_lines(uint32_t set, uint32_t clr) { k10d_cpucom_hold106 = (k10d_cpucom_hold106 | set) & ~clr; }
+uint64_t k10d_cpucom_take_vecs(void) { return ext_vec_req ? __atomic_exchange_n(&ext_vec_req, 0, __ATOMIC_SEQ_CST) : 0; }
 
 /* Attention (vector 31): asserted while the model has a status message to deliver,
  * as one edge per completed transaction. Returns 1 when the caller should raise it. */
@@ -310,6 +346,9 @@ uint8_t k10d_cpucom_rx(FILE *out)
             /* This family (table 0x105a7a3c, class cls_105a7a9c) is registered in the
              * response registry only under 0x07: its replies must carry resp0 = 0x07. */
             st_cur.b[0] = 0x07; st_cur.b[1] = 0; st_cur.len = 2;
+        } else if (st_cmd == 0x02 && getenv("FRN_DSP_R02")) {
+            /* experiment: resp0 for Cmd 0x02 (release request) */
+            st_cur.b[0] = (uint8_t)strtoul(getenv("FRN_DSP_R02"), NULL, 16); st_cur.b[1] = 0; st_cur.len = 2;
         } else {
             st_cur.b[0] = (uint8_t)st_cmd; st_cur.b[1] = 0; st_cur.len = 2;   /* echo, no data */
         }

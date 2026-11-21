@@ -160,7 +160,7 @@ int k10d_img_read16(uint32_t a, uint32_t *v)
     int u = rc_unit(a);
     if (u >= 0) {
         unsigned off = a - rc_base[u], i = off >> 1;
-        if (off == 0x1ffe) { *v = rc_st_hi[u]; return 1; }
+        if (off == 0x1ffe) { static long nrd; if (log_on && out && rc_get(u, 6) == 0x1ac && nrd++ < 40) fprintf(out, "[rc%d] read status %04x\n", u, rc_st_hi[u]); *v = rc_st_hi[u]; return 1; }
         if (off == 0x000e) { *v = rc_st_lo[u]; return 1; }
         if (!rc_written[u][i]) return 0; *v = rc_regs[u][i]; return 1; }
     if (a < IMG_BASE || a >= IMG_BASE + 0x200) return 0;
@@ -193,6 +193,8 @@ int k10d_img_write16(uint32_t a, uint32_t v, FILE *log, uint32_t (*ram16)(uint32
     int u = rc_unit(a);
     if (u >= 0) {
         unsigned off = a - rc_base[u], i = off >> 1;
+        if (off == 0x1ffe || off == 0x000e) {
+            static long nclr; if (log_on && rc_get(u, 6) == 0x1ac && nclr++ < 40) fprintf(out, "[rc%d] clear +%04x <- %04x\n", u, off, v & 0xffff); }
         if (off == 0x1ffe) { rc_st_hi[u] &= ~(uint16_t)v; return 1; }
         if (off == 0x000e) { rc_st_lo[u] &= ~(uint16_t)v; return 1; }
         rc_regs[u][i] = (uint16_t)v; rc_written[u][i] = 1;

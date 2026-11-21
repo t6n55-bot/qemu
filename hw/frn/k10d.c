@@ -181,6 +181,48 @@ static uint64_t frn_bg_read(void *opaque, hwaddr addr, unsigned size)
     frn_log_unmapped("RD", (uint32_t)addr, 0, size);   /* truly-dark read -> 0 */
     return 0;
 }
+/* Imaging-engine completion model (FRN_ENGINE_DONE=0 disables). Found from the
+ * capture pipeline (2026-11-21, local experiment):
+ *  - pre-process/repack engine 0x400d0000: start = write 0x400d0004 with bit15;
+ *    IRQ vec42 (hw_irq_source_demux case 0x1a) needs 0x400d0006 bit15 (W1C) and
+ *    0x400d0004 bit15, then posts IRQ source 0x8000001a+... (0x80000014).
+ *  - develop engine 0x40128000/0x40100000: start = write 0x40128100 with bit14
+ *    (configure_sensor_readout_params_104f3de0); IRQ vec34 (case 0x12,
+ *    clock_tick_post_a) reads status 0x40128004 & 0x301 (W1C) & enable 0x40128002.
+ * The work itself completes instantly; only the done status + IRQ are modelled. */
+extern void k10d_cpucom_raise_vec(int v);
+static uint64_t frn_bg_stored(hwaddr addr, unsigned size, uint64_t dflt, int *any);
+static int frn_engine_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *s = getenv("FRN_ENGINE_DONE"); on = !(s && s[0] == '0'); }
+    return on;
+}
+static void frn_bg_put16(uint32_t a, uint32_t v)
+{
+    g_hash_table_insert(frn_bg_store, GUINT_TO_POINTER(a + 1), GUINT_TO_POINTER(((v >> 8) & 0xff) + 1));
+    g_hash_table_insert(frn_bg_store, GUINT_TO_POINTER(a + 2), GUINT_TO_POINTER((v & 0xff) + 1));
+}
+static void frn_engine_done(uint32_t addr, uint32_t val, unsigned size)
+{
+    if (!frn_engine_on()) return;
+    static int log = -1; if (log < 0) log = getenv("FRN_IMG_LOG") ? 1 : 0;
+    static long n34, n42;
+    int any;
+    if (addr == 0x400d0004 && size == 2 && (val & 0x8000)) {
+        frn_bg_put16(0x400d0006, frn_bg_stored(0x400d0006, 2, 0, &any) | 0x8000);
+        k10d_cpucom_raise_vec(42);
+        if (log && n42++ < 20) fprintf(stderr, "[eng] 0x400d0000 start -> done, vec42\n");
+    } else if (addr == 0x40128100 && size == 2 && (val & 0x4000)) {
+        static long bits = -2;
+        if (bits == -2) { const char *e = getenv("FRN_ENG34_BITS"); bits = e ? strtol(e, NULL, 16) : 0x100; }
+        uint32_t en = frn_bg_stored(0x40128002, 2, 0, &any) & 0x301 & bits;
+        frn_bg_put16(0x40128004, (frn_bg_stored(0x40128004, 2, 0, &any) | en) & 0xffff);
+        k10d_cpucom_raise_vec(34);
+        if (log && (n34++ < 20 || n34 % 500 == 0))
+            fprintf(stderr, "[eng] develop start #%ld -> done (status 0x%x), vec34\n", n34, en);
+    }
+}
 static void frn_bg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     /*
@@ -216,9 +258,14 @@ static void frn_bg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     frn_log_unmapped("WR", (uint32_t)addr, (uint32_t)val, size);  /* first write per address */
     if (frn_bg_ram_on()) {
         if (!frn_bg_store) frn_bg_store = g_hash_table_new(g_direct_hash, g_direct_equal);
+        /* Write-1-to-clear IRQ status registers of the imaging engines (see frn_engine_done). */
+        if (size == 2 && frn_engine_on() && (addr == 0x40128004 || addr == 0x400d0006)) {
+            int any; val = frn_bg_stored(addr, 2, 0, &any) & ~val;
+        }
         for (unsigned i = 0; i < size; i++)
             g_hash_table_insert(frn_bg_store, GUINT_TO_POINTER((uint32_t)addr + i + 1),
                                 GUINT_TO_POINTER((uint32_t)((val >> (8 * (size - 1 - i))) & 0xff) + 1));
+        frn_engine_done((uint32_t)addr, (uint32_t)val, size);
     }
 }
 static const MemoryRegionOps frn_bg_ops = {
@@ -399,9 +446,14 @@ static void frn_p67_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
           k10d_sd_dbg_regs[0] = (uint32_t)frn_p67[0] << 24 | frn_p67[1] << 16 | frn_p67[2] << 8 | frn_p67[3];
           k10d_sd_dbg_regs[1] = (uint32_t)frn_p67[0x0c] << 8 | frn_p67[0x0d];
           k10d_sd_dbg_regs[2] = (uint32_t)frn_p67[0x06] << 8 | frn_p67[0x07]; }
-        { static int wpc = -1; if (wpc < 0) wpc = getenv("FRN_SD_WIPEPC") ? 1 : 0;
+        { static int wpc = -1; static long sarg = -2;
+          if (wpc < 0) wpc = getenv("FRN_SD_WIPEPC") ? 1 : 0;
+          /* FRN_SD_STACKARG=hex: same stack dump for any data command with this argument
+           * (finds the caller chain of a given sector read, e.g. the root-dir re-reads). */
+          if (sarg == -2) { const char *s = getenv("FRN_SD_STACKARG"); sarg = s ? (long)strtoul(s, NULL, 16) : -1; }
           int wi = cmd >> 8;   /* CMD24=0x18 single write, CMD25=0x19 multi write */
-          if (wpc && (wi == 24 || wi == 25) && sd_arg < 0x20000 && current_cpu) {
+          if (((wpc && (wi == 24 || wi == 25) && sd_arg < 0x20000) || (sarg >= 0 && sd_arg == (uint32_t)sarg && wi >= 17))
+              && current_cpu) {
               CPUFRNState *e = &FRN_CPU(current_cpu)->env;
               fprintf(stderr, "[sdwipe] CMD%d arg 0x%08x (sector %u) PC 0x%08x rp 0x%08x sp 0x%08x\n",
                       wi, sd_arg, sd_arg >> 9, e->pc, e->rp, e->regs[15]);
